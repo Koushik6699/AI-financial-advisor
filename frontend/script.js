@@ -3,7 +3,7 @@
    Currency: Indian Rupees (₹)
 ────────────────────────────────────────── */
 
-const API = "https://ai-financial-advisor-vi9p.onrender.com";
+const API = "https://ai-financial-advisor-vi9p.onrender.com/api";
 let analysisData = null;
 let financialContext = "";
 let chatHistory = [];
@@ -186,7 +186,7 @@ Goal: ${payload.goals}
   } catch (err) {
     hideLoading();
     console.error(err);
-    alert("❌ Could not connect to backend.\n\nMake sure you ran: python app.py\nServer should be on http://localhost:5000");
+    alert("❌ Could not connect to the backend server.\n\nThe server may be starting up (Render free tier sleeps after inactivity — wait 30 seconds and try again).");
   } finally {
     document.getElementById("btn-text").classList.remove("hidden");
     document.getElementById("btn-loader").classList.add("hidden");

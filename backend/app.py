@@ -10,7 +10,12 @@ import google.generativeai as genai
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=[
+    "https://finance-advisor-ai.netlify.app",  # production frontend
+    "http://localhost:5000",                    # local backend testing
+    "http://127.0.0.1:5500",                   # VS Code Live Server
+    "null",                                     # local file:// opening
+])
 
 # ── Configure Gemini (same pattern as working project) ──────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
