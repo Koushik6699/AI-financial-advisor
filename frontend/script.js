@@ -3,7 +3,7 @@
    Currency: Indian Rupees (₹)
 ────────────────────────────────────────── */
 
-const API = "http://localhost:5000/api";
+const API = "https://ai-financial-advisor-vi9p.onrender.com";
 let analysisData = null;
 let financialContext = "";
 let chatHistory = [];
