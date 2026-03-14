@@ -164,11 +164,32 @@ Goal: ${payload.goals}
   animateLoadingSteps();
 
   try {
+    // Step 1: Wake up Render server (free tier sleeps after inactivity)
+    setLoadingMessage("Waking up server...");
+    try {
+      await fetch(`${API}/health`, { method: "GET", signal: AbortSignal.timeout(8000) });
+    } catch (_) {
+      // Server might still be waking — wait and continue anyway
+      await new Promise(r => setTimeout(r, 3000));
+    }
+
+    // Step 2: Send actual analysis request (with longer timeout for Gemini)
+    setLoadingMessage("Gemini AI is processing your profile...");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 90000); // 90s timeout
+
     const res = await fetch(`${API}/analyze`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      signal: controller.signal,
     });
+    clearTimeout(timeout);
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Server error ${res.status}: ${errText.slice(0, 200)}`);
+    }
 
     const result = await res.json();
 
@@ -181,12 +202,18 @@ Goal: ${payload.goals}
       showPage("dashboard");
     } else {
       hideLoading();
-      alert(`Analysis failed: ${result.error || "Unknown error"}\n\nCheck the terminal for details.`);
+      alert(`Analysis failed: ${result.error || "Unknown error"}\n\nPlease try again.`);
     }
   } catch (err) {
     hideLoading();
-    console.error(err);
-    alert("❌ Could not connect to the backend server.\n\nThe server may be starting up (Render free tier sleeps after inactivity — wait 30 seconds and try again).");
+    console.error("Fetch error:", err);
+    if (err.name === "AbortError") {
+      alert("⏱️ Request timed out.\n\nGemini AI took too long to respond. Please try again — the server is now awake and the next attempt will be faster.");
+    } else if (err.message.includes("Failed to fetch") || err.message.includes("NetworkError")) {
+      alert("❌ Could not reach the backend.\n\nPossible reasons:\n• Render server is still waking up (wait 30 sec and retry)\n• Check: https://ai-financial-advisor-vi9p.onrender.com/api/health");
+    } else {
+      alert(`❌ Error: ${err.message}\n\nPlease try again.`);
+    }
   } finally {
     document.getElementById("btn-text").classList.remove("hidden");
     document.getElementById("btn-loader").classList.add("hidden");
@@ -199,6 +226,10 @@ Goal: ${payload.goals}
 // ══════════════════════════════════════════
 function showLoading() { document.getElementById("loadingOverlay").classList.remove("hidden"); }
 function hideLoading() { document.getElementById("loadingOverlay").classList.add("hidden"); }
+function setLoadingMessage(msg) {
+  const el = document.getElementById("loading-sub");
+  if (el) el.textContent = msg;
+}
 
 function animateLoadingSteps() {
   ["lp1","lp2","lp3","lp4","lp5"].forEach((id, i) => {
