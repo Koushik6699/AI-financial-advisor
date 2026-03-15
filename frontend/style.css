@@ -828,3 +828,27 @@ body {
   .score-metrics-grid { grid-template-columns: 1fr 1fr; }
   .tax-summary-banner { grid-template-columns: 1fr; }
 }
+
+/* ─────────────────────────────────────────
+   SKELETON LOADERS — Phase 2 placeholders
+───────────────────────────────────────── */
+.skeleton-box {
+  background: linear-gradient(
+    90deg,
+    var(--surface2) 25%,
+    var(--surface3) 50%,
+    var(--surface2) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.6s infinite;
+  border-radius: var(--r);
+}
+
+.skeleton-text-block {
+  padding: 8px 0;
+}
+
+@keyframes shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}

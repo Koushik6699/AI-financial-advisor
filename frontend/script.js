@@ -128,7 +128,9 @@ function updateCashflowPreview() {
 });
 
 // ══════════════════════════════════════════
-// FORM SUBMIT
+// FORM SUBMIT  — 2-phase loading
+// Phase 1 /analyze-quick  → score + metrics → show dashboard (~15s)
+// Phase 2 /analyze-deep   → roadmap + tax + insights → fill in (~20s)
 // ══════════════════════════════════════════
 async function submitForm(e) {
   e.preventDefault();
@@ -161,58 +163,50 @@ Goal: ${payload.goals}
   document.getElementById("analyzeBtn").disabled = true;
 
   showLoading();
-  animateLoadingSteps();
 
   try {
-    // Step 1: Wake up Render server (free tier sleeps after inactivity)
-    setLoadingMessage("Waking up server...");
+    // ── Wake up Render server ──────────────────────────────────────
+    setLoadingStep(1, "Connecting to server...");
     try {
-      await fetch(`${API}/health`, { method: "GET", signal: AbortSignal.timeout(8000) });
+      await fetch(`${API}/health`, { method: "GET", signal: AbortSignal.timeout(10000) });
     } catch (_) {
-      // Server might still be waking — wait and continue anyway
       await new Promise(r => setTimeout(r, 3000));
     }
 
-    // Step 2: Send actual analysis request (with longer timeout for Gemini)
-    setLoadingMessage("Gemini AI is processing your profile...");
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 90000); // 90s timeout
-
-    const res = await fetch(`${API}/analyze`, {
+    // ── PHASE 1: Quick analysis — score, metrics, actions, goal ───
+    setLoadingStep(2, "Calculating your financial score...");
+    const quickRes = await fetch(`${API}/analyze-quick`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
-      signal: controller.signal,
+      signal: AbortSignal.timeout(60000),
     });
-    clearTimeout(timeout);
 
-    if (!res.ok) {
-      const errText = await res.text();
-      throw new Error(`Server error ${res.status}: ${errText.slice(0, 200)}`);
-    }
+    if (!quickRes.ok) throw new Error(`Server error ${quickRes.status}`);
+    const quickResult = await quickRes.json();
+    if (!quickResult.success) throw new Error(quickResult.error || "Phase 1 failed");
 
-    const result = await res.json();
+    // Show dashboard immediately with Phase 1 data
+    setLoadingStep(3, "Building your dashboard...");
+    analysisData = quickResult.data;
+    trackerData  = {};
+    buildDashboardPhase1(analysisData);
+    unlockNav();
+    hideLoading();
+    showPage("dashboard");
 
-    if (result.success) {
-      analysisData = result.data;
-      trackerData = {};
-      buildDashboard(analysisData);
-      unlockNav();
-      hideLoading();
-      showPage("dashboard");
-    } else {
-      hideLoading();
-      alert(`Analysis failed: ${result.error || "Unknown error"}\n\nPlease try again.`);
-    }
+    // ── PHASE 2: Deep analysis — runs in background while user reads Phase 1
+    loadDeepAnalysis(payload);
+
   } catch (err) {
     hideLoading();
-    console.error("Fetch error:", err);
-    if (err.name === "AbortError") {
-      alert("⏱️ Request timed out.\n\nGemini AI took too long to respond. Please try again — the server is now awake and the next attempt will be faster.");
-    } else if (err.message.includes("Failed to fetch") || err.message.includes("NetworkError")) {
-      alert("❌ Could not reach the backend.\n\nPossible reasons:\n• Render server is still waking up (wait 30 sec and retry)\n• Check: https://ai-financial-advisor-vi9p.onrender.com/api/health");
+    console.error("Submit error:", err);
+    if (err.name === "TimeoutError" || err.name === "AbortError") {
+      alert("⏱️ Request timed out.\n\nThe server is now warm — please try again, it will be faster.");
+    } else if (err.message.includes("Failed to fetch")) {
+      alert("❌ Cannot reach server.\n\nWait 30 seconds (Render waking up) then try again.\nOr check: https://ai-financial-advisor-vi9p.onrender.com/api/health");
     } else {
-      alert(`❌ Error: ${err.message}\n\nPlease try again.`);
+      alert(`❌ ${err.message}\n\nPlease try again.`);
     }
   } finally {
     document.getElementById("btn-text").classList.remove("hidden");
@@ -221,22 +215,104 @@ Goal: ${payload.goals}
   }
 }
 
+// Runs silently in background after Phase 1 dashboard is shown
+async function loadDeepAnalysis(payload) {
+  try {
+    showDeepLoadingBanner("Loading investment roadmap & insights...");
+
+    const deepRes = await fetch(`${API}/analyze-deep`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(90000),
+    });
+
+    if (!deepRes.ok) throw new Error(`Deep analysis error ${deepRes.status}`);
+    const deepResult = await deepRes.json();
+    if (!deepResult.success) throw new Error(deepResult.error);
+
+    // Merge deep data into analysisData
+    const deep = deepResult.data;
+    analysisData = { ...analysisData, ...deep };
+
+    // Update the sections that now have data
+    if (deep.future_projections)           renderProjectionChart(deep.future_projections);
+    if (deep.spending_breakdown)           renderBudgetChart(deep.spending_breakdown);
+    if (deep.investment_roadmap)           renderRoadmap(deep.investment_roadmap);
+    if (deep.tax_optimization)             { renderInsights(deep.ai_insights, analysisData.positive_highlights, analysisData.risk_warnings); }
+    if (deep.ai_insights)                  renderInsights(deep.ai_insights, analysisData.positive_highlights, analysisData.risk_warnings);
+
+    hideDeepLoadingBanner();
+    showDeepLoadingBanner("✅ Full analysis complete!", true);
+    setTimeout(hideDeepLoadingBanner, 3000);
+
+  } catch (err) {
+    console.error("Deep analysis error:", err);
+    hideDeepLoadingBanner();
+    showDeepLoadingBanner("⚠️ Roadmap & insights timed out — dashboard data is complete.", false, true);
+    setTimeout(hideDeepLoadingBanner, 6000);
+  }
+}
+
 // ══════════════════════════════════════════
-// LOADING
+// LOADING HELPERS
 // ══════════════════════════════════════════
 function showLoading() { document.getElementById("loadingOverlay").classList.remove("hidden"); }
-function hideLoading() { document.getElementById("loadingOverlay").classList.add("hidden"); }
+function hideLoading()  { document.getElementById("loadingOverlay").classList.add("hidden"); }
+
 function setLoadingMessage(msg) {
   const el = document.getElementById("loading-sub");
   if (el) el.textContent = msg;
 }
 
-function animateLoadingSteps() {
-  ["lp1","lp2","lp3","lp4","lp5"].forEach((id, i) => {
-    setTimeout(() => {
-      document.getElementById(id)?.classList.add("done");
-    }, (i + 1) * 900);
+// Update loading overlay step text + mark previous done
+function setLoadingStep(stepNum, msg) {
+  setLoadingMessage(msg);
+  const steps = ["lp1","lp2","lp3","lp4","lp5"];
+  steps.forEach((id, i) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (i < stepNum - 1) el.classList.add("done");
+    else el.classList.remove("done");
   });
+  const cur = document.getElementById(steps[stepNum - 1]);
+  if (cur) cur.classList.add("done");
+}
+
+// Banner shown at top of dashboard during Phase 2 background load
+function showDeepLoadingBanner(msg, success = false, warn = false) {
+  let banner = document.getElementById("deepLoadBanner");
+  if (!banner) {
+    banner = document.createElement("div");
+    banner.id = "deepLoadBanner";
+    banner.style.cssText = `
+      position:fixed; top:62px; left:50%; transform:translateX(-50%);
+      z-index:300; padding:10px 24px; border-radius:100px;
+      font-size:0.85rem; font-weight:600; font-family:var(--ff-body);
+      display:flex; align-items:center; gap:10px;
+      box-shadow:0 4px 20px rgba(0,0,0,0.3);
+      transition: all 0.3s ease; white-space:nowrap;
+    `;
+    document.body.appendChild(banner);
+  }
+  if (success) {
+    banner.style.background = "var(--green)"; banner.style.color = "#fff";
+  } else if (warn) {
+    banner.style.background = "var(--amber)"; banner.style.color = "#fff";
+  } else {
+    banner.style.background = "var(--surface)"; banner.style.color = "var(--accent2)";
+    banner.style.border = "1px solid var(--accentbr)";
+  }
+  const spinner = (!success && !warn)
+    ? `<span style="width:14px;height:14px;border:2px solid var(--accentbr);border-top-color:var(--accent2);border-radius:50%;display:inline-block;animation:spin 0.7s linear infinite"></span>`
+    : "";
+  banner.innerHTML = `${spinner}${msg}`;
+  banner.style.display = "flex";
+}
+
+function hideDeepLoadingBanner() {
+  const b = document.getElementById("deepLoadBanner");
+  if (b) b.style.display = "none";
 }
 
 function unlockNav() {
@@ -246,9 +322,11 @@ function unlockNav() {
 }
 
 // ══════════════════════════════════════════
-// DASHBOARD
+// DASHBOARD — 2-phase build
 // ══════════════════════════════════════════
-function buildDashboard(d) {
+
+// Phase 1: Show immediately after quick API (~15s)
+function buildDashboardPhase1(d) {
   document.getElementById("dashTitle").textContent = "Financial Dashboard";
   document.getElementById("dashSub").textContent =
     `Report for ${v("f-name") || "you"} · Generated ${new Date().toLocaleDateString("en-IN")}`;
@@ -256,12 +334,55 @@ function buildDashboard(d) {
   renderScoreRing(d.financial_fitness_score, d.score_grade, d.score_description);
   renderHealthMetrics(d.financial_health_metrics);
   renderMonthlySnap(d.monthly_analysis);
-  renderProjectionChart(d.future_projections);
-  renderBudgetChart(d.spending_breakdown);
-  renderRoadmap(d.investment_roadmap);
   renderActions(d.immediate_action_items);
-  renderInsights(d.ai_insights, d.positive_highlights, d.risk_warnings);
   renderGoal(d.goal_feasibility);
+  renderInsights("", d.positive_highlights, d.risk_warnings);
+
+  // Show skeleton placeholders for Phase 2 sections
+  showSkeleton("projChart");
+  showSkeleton("budgetChart");
+  showSkeletonBlock("roadmapGrid",  "Investment roadmap loading...");
+  showSkeletonBlock("insightBody",  "AI insights loading...");
+}
+
+// Skeleton helpers — grey animated boxes while Phase 2 loads
+function showSkeleton(canvasId) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const wrap = canvas.parentElement;
+  let sk = wrap.querySelector(".skeleton-box");
+  if (!sk) {
+    sk = document.createElement("div");
+    sk.className = "skeleton-box";
+    sk.style.cssText = "height:200px;border-radius:12px;";
+    wrap.insertBefore(sk, canvas);
+  }
+  canvas.style.display = "none";
+  sk.style.display = "block";
+}
+
+function hideSkeleton(canvasId) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const sk = canvas.parentElement.querySelector(".skeleton-box");
+  if (sk) sk.style.display = "none";
+  canvas.style.display = "";
+}
+
+function showSkeletonBlock(elId, msg) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  el.innerHTML = `<div class="skeleton-text-block">
+    <div class="skeleton-box" style="height:18px;width:60%;margin-bottom:10px;border-radius:6px;"></div>
+    <div class="skeleton-box" style="height:14px;width:80%;margin-bottom:8px;border-radius:6px;"></div>
+    <div class="skeleton-box" style="height:14px;width:70%;border-radius:6px;"></div>
+    <p style="margin-top:14px;font-size:0.8rem;color:var(--text3)">${msg}</p>
+  </div>`;
+}
+
+// Kept for compatibility (PDF generation calls this)
+function buildDashboard(d) {
+  buildDashboardPhase1(d);
 }
 
 function renderScoreRing(score, grade, desc) {
@@ -309,6 +430,7 @@ function renderMonthlySnap(ma) {
 }
 
 function renderProjectionChart(proj) {
+  hideSkeleton("projChart");
   const isDark = document.documentElement.getAttribute("data-theme") === "dark";
   const gc = isDark ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.05)";
   const tc = isDark ? "#8a97ab" : "#6b7280";
@@ -339,6 +461,7 @@ function renderProjectionChart(proj) {
 }
 
 function renderBudgetChart(breakdown) {
+  hideSkeleton("budgetChart");
   const isDark = document.documentElement.getAttribute("data-theme") === "dark";
   const ctx = document.getElementById("budgetChart").getContext("2d");
   if (budgetChart) budgetChart.destroy();

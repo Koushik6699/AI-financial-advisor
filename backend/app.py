@@ -4,6 +4,7 @@ import os
 import re
 import json
 import traceback
+import threading
 from dotenv import load_dotenv
 import google.generativeai as genai
 
@@ -12,7 +13,7 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
-# ── Configure Gemini (same pattern as working project) ──────────────────────
+# ── Configure Gemini ──────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -27,189 +28,188 @@ def home():
         "status": "AI Financial Advisor API is running",
         "model": "gemini-2.5-flash",
         "currency": "INR (Rs. / ₹)",
-        "endpoints": ["/api/analyze", "/api/chat", "/api/spending-advice", "/api/health"]
+        "endpoints": ["/api/analyze-quick", "/api/analyze-deep", "/api/chat", "/api/spending-advice", "/api/health"]
     })
 
 
-# ── JSON extractor ───────────────────────────────────────────────────────────
+# ── JSON extractor ────────────────────────────────────────────────────────────
 def extract_json(text):
-    """Robustly extract JSON from Gemini response."""
     text = text.strip()
-
-    # Strip markdown fences
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"\s*```\s*$",        "", text, flags=re.MULTILINE)
     text = text.strip()
-
-    # Try direct parse first
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-
-    # Find first complete { ... } block
     start = text.find("{")
     if start == -1:
         start = text.find("[")
         if start == -1:
-            raise ValueError("No JSON found in Gemini response")
-
+            raise ValueError("No JSON found in response")
     open_ch  = text[start]
     close_ch = "}" if open_ch == "{" else "]"
-    depth = 0
-    end = start
-    in_string = False
-    escape_next = False
-
+    depth = 0; end = start; in_string = False; escape_next = False
     for i, ch in enumerate(text[start:], start):
-        if escape_next:        escape_next = False; continue
-        if ch == "\\" and in_string: escape_next = True; continue
-        if ch == '"':          in_string = not in_string; continue
-        if in_string:          continue
-        if ch == open_ch:      depth += 1
+        if escape_next:              escape_next = False; continue
+        if ch == "\\" and in_string: escape_next = True;  continue
+        if ch == '"':                in_string = not in_string; continue
+        if in_string:                continue
+        if ch == open_ch:            depth += 1
         elif ch == close_ch:
             depth -= 1
-            if depth == 0:     end = i; break
-
+            if depth == 0:           end = i; break
     return json.loads(text[start:end + 1])
 
 
-# ── /api/analyze ─────────────────────────────────────────────────────────────
-@app.route("/api/analyze", methods=["POST"])
-def analyze():
-    if not gemini_model:
-        return jsonify({"success": False, "error": "Gemini API key not configured in .env"}), 500
+def build_profile(data):
+    return (
+        f"Name:{data.get('name','User')} | Age:{data.get('age')} | Employment:{data.get('employment')}\n"
+        f"Income:Rs.{data.get('income',0)}/mo | Expenses:Rs.{data.get('expenses',0)}/mo | "
+        f"Savings:Rs.{data.get('savings',0)}/mo\n"
+        f"Existing Savings:Rs.{data.get('current_savings',0)} | Debt:Rs.{data.get('debt',0)}\n"
+        f"Risk:{data.get('risk_tolerance','Moderate')} | Timeline:{data.get('timeline',5)}yrs\n"
+        f"Goal:{data.get('goals','N/A')}"
+    )
 
+
+# ── /api/analyze-quick  (Phase 1 — returns in ~15 seconds) ───────────────────
+# Score, grade, 6 metrics, monthly snapshot, immediate actions, highlights
+@app.route("/api/analyze-quick", methods=["POST"])
+def analyze_quick():
+    if not gemini_model:
+        return jsonify({"success": False, "error": "Gemini not configured"}), 500
     raw_text = ""
     try:
         data = request.get_json(force=True)
-        if not data:
-            return jsonify({"success": False, "error": "No JSON body received"}), 400
+        profile = build_profile(data)
 
-        name     = data.get("name", "User")
-        age      = data.get("age", "N/A")
-        emp      = data.get("employment", "N/A")
-        income   = data.get("income", 0)
-        expenses = data.get("expenses", 0)
-        savings  = data.get("savings", 0)
-        cur_sav  = data.get("current_savings", 0)
-        debt     = data.get("debt", 0)
-        risk     = data.get("risk_tolerance", "Moderate")
-        goals    = data.get("goals", "N/A")
-        timeline = data.get("timeline", 5)
-
-        prompt = f"""You are a senior certified financial planner (CFP) with 20 years of experience in India.
-Analyze this Indian financial profile and produce a comprehensive personalized financial report.
-All monetary values must be in Indian Rupees (no dollar signs).
-Use Indian investment options: PPF, ELSS, NPS, SIP, Nifty/Sensex index funds, FD, RD, mutual funds, gold bonds.
-Reference Indian tax laws: Section 80C (1.5L limit), 80D, 80CCD(1B) for NPS, LTCG, STCG, new vs old tax regime.
+        prompt = f"""Indian CFP expert. Analyze this profile. Return ONLY compact JSON, no markdown.
 
 PROFILE:
-Name: {name}
-Age: {age}
-Employment: {emp}
-Monthly Income (after tax): Rs.{income}
-Monthly Expenses: Rs.{expenses}
-Monthly Savings: Rs.{savings}
-Existing Savings/Investments: Rs.{cur_sav}
-Total Debt: Rs.{debt}
-Risk Tolerance: {risk}
-Financial Goals: {goals}
-Investment Timeline: {timeline} years
+{profile}
 
-YOU MUST respond with ONLY a valid JSON object. No markdown. No extra text. Start directly with {{ and end with }}.
-
+Return ONLY this JSON (start with {{, end with }}):
 {{
-  "financial_fitness_score": <integer 0-100>,
+  "financial_fitness_score": <0-100>,
   "score_grade": "<A+|A|A-|B+|B|B-|C+|C|D|F>",
-  "score_description": "<2-3 sentence expert assessment>",
+  "score_description": "<2 sentences max>",
   "monthly_analysis": {{
-    "income": <number>,
-    "expenses": <number>,
-    "savings": <number>,
-    "disposable": <number>,
-    "savings_rate": <number>,
-    "expense_ratio": <number>,
-    "investment_capacity": <number>
+    "income": <n>, "expenses": <n>, "savings": <n>,
+    "disposable": <n>, "savings_rate": <n>,
+    "expense_ratio": <n>, "investment_capacity": <n>
   }},
   "financial_health_metrics": [
-    {{"metric": "Emergency Fund Status", "status": "<Good|Fair|Poor>", "score": <0-100>, "detail": "<detail>"}},
-    {{"metric": "Debt-to-Income Ratio",  "status": "<Good|Fair|Poor>", "score": <0-100>, "detail": "<detail>"}},
-    {{"metric": "Savings Rate",          "status": "<Good|Fair|Poor>", "score": <0-100>, "detail": "<detail>"}},
-    {{"metric": "Investment Readiness",  "status": "<Good|Fair|Poor>", "score": <0-100>, "detail": "<detail>"}},
-    {{"metric": "Cash Flow Health",      "status": "<Good|Fair|Poor>", "score": <0-100>, "detail": "<detail>"}},
-    {{"metric": "Retirement Trajectory", "status": "<Good|Fair|Poor>", "score": <0-100>, "detail": "<detail>"}}
-  ],
-  "future_projections": [
-    {{"year": 1,  "projected_savings": <number>, "projected_investment_value": <number>, "net_worth": <number>}},
-    {{"year": 3,  "projected_savings": <number>, "projected_investment_value": <number>, "net_worth": <number>}},
-    {{"year": 5,  "projected_savings": <number>, "projected_investment_value": <number>, "net_worth": <number>}},
-    {{"year": 10, "projected_savings": <number>, "projected_investment_value": <number>, "net_worth": <number>}},
-    {{"year": 20, "projected_savings": <number>, "projected_investment_value": <number>, "net_worth": <number>}}
-  ],
-  "investment_roadmap": [
-    {{
-      "priority": <integer 1-6>,
-      "category": "<e.g. Emergency Fund | ELSS SIP | PPF | NPS | Nifty Index Fund | FD>",
-      "action": "<specific actionable step>",
-      "allocation_percent": <number>,
-      "monthly_amount": <number>,
-      "expected_return": "<e.g. 11-13% CAGR>",
-      "timeline": "<e.g. 3-5 years>",
-      "risk_level": "<Low|Medium|High>",
-      "why": "<why this fits their profile>"
-    }}
-  ],
-  "spending_breakdown": [
-    {{"category": "<category>", "suggested_percent": <number>, "suggested_amount": <number>, "current_status": "<On Track|Over Budget|Under Utilized>"}}
-  ],
-  "tax_optimization": {{
-    "estimated_tax_bracket": "<e.g. 20% slab (Rs.10L-12L)>",
-    "annual_tax_estimate": <number>,
-    "strategies": [
-      {{"strategy": "<e.g. Maximize Section 80C>", "potential_savings": "<e.g. Rs.46800/year>", "how": "<step-by-step>", "priority": "<High|Medium|Low>"}}
-    ],
-    "tax_advantaged_accounts": ["<e.g. PPF: 7.1% tax-free, Rs.1.5L limit under 80C>"],
-    "summary": "<2 sentence Indian tax planning summary>"
-  }},
-  "spending_tracker_categories": [
-    {{"category": "<name>", "recommended_monthly": <number>, "icon": "<emoji>", "tips": "<tip>"}}
+    {{"metric": "Emergency Fund Status", "status": "<Good|Fair|Poor>", "score": <0-100>, "detail": "<1 sentence>"}},
+    {{"metric": "Debt-to-Income Ratio",  "status": "<Good|Fair|Poor>", "score": <0-100>, "detail": "<1 sentence>"}},
+    {{"metric": "Savings Rate",          "status": "<Good|Fair|Poor>", "score": <0-100>, "detail": "<1 sentence>"}},
+    {{"metric": "Investment Readiness",  "status": "<Good|Fair|Poor>", "score": <0-100>, "detail": "<1 sentence>"}},
+    {{"metric": "Cash Flow Health",      "status": "<Good|Fair|Poor>", "score": <0-100>, "detail": "<1 sentence>"}},
+    {{"metric": "Retirement Trajectory", "status": "<Good|Fair|Poor>", "score": <0-100>, "detail": "<1 sentence>"}}
   ],
   "immediate_action_items": [
-    {{"priority": "<High|Medium|Low>", "action": "<action>", "impact": "<impact>", "timeframe": "<timeframe>", "effort": "<Easy|Medium|Hard>"}}
+    {{"priority": "<High|Medium|Low>", "action": "<action under 10 words>", "impact": "<impact under 10 words>", "timeframe": "<timeframe>", "effort": "<Easy|Medium|Hard>"}}
   ],
-  "risk_warnings": ["<warning>"],
-  "positive_highlights": ["<highlight>"],
-  "ai_insights": "<4-5 paragraph personalized narrative using Indian investment context and their specific numbers>",
+  "risk_warnings":       ["<warning under 10 words>"],
+  "positive_highlights": ["<highlight under 10 words>"],
   "goal_feasibility": {{
-    "goal": "<restate their goal>",
+    "goal": "<restate in 1 sentence>",
     "feasibility": "<Highly Feasible|Feasible|Challenging|Difficult>",
-    "estimated_achievement_date": "<year or month/year>",
-    "monthly_required": <number>,
-    "current_monthly_savings": <number>,
-    "gap": <number>,
-    "gap_analysis": "<specific gap analysis>",
-    "milestones": ["<milestone 1>", "<milestone 2>", "<milestone 3>"]
+    "estimated_achievement_date": "<year>",
+    "monthly_required": <n>,
+    "current_monthly_savings": <n>,
+    "gap": <n>,
+    "gap_analysis": "<2 sentences>",
+    "milestones": ["<milestone>", "<milestone>", "<milestone>"]
   }}
 }}"""
 
-        print(f"\n{'='*55}")
-        print(f"[analyze] User: {name} | Income: Rs.{income} | Risk: {risk}")
-
-        response  = gemini_model.generate_content(prompt)
-        raw_text  = response.text
-        print(f"[analyze] Response: {len(raw_text)} chars | Preview: {raw_text[:200]}")
-
-        analysis  = extract_json(raw_text)
-        print(f"[analyze] OK — Score: {analysis.get('financial_fitness_score')}, Grade: {analysis.get('score_grade')}")
-        return jsonify({"success": True, "data": analysis})
+        print(f"[quick] {data.get('name')} — sending phase 1")
+        response = gemini_model.generate_content(prompt)
+        raw_text = response.text
+        result   = extract_json(raw_text)
+        print(f"[quick] done — score:{result.get('financial_fitness_score')}")
+        return jsonify({"success": True, "data": result})
 
     except json.JSONDecodeError as e:
-        print(f"[analyze] JSON ERROR: {e}\nRaw:\n{raw_text[:1500]}")
-        return jsonify({"success": False, "error": f"AI returned malformed JSON. Please try again. ({e})"}), 500
+        print(f"[quick] JSON error: {e}\n{raw_text[:800]}")
+        return jsonify({"success": False, "error": f"JSON parse failed: {e}"}), 500
     except Exception as e:
-        print(f"[analyze] ERROR: {e}")
-        traceback.print_exc()
+        print(f"[quick] error: {e}"); traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ── /api/analyze-deep  (Phase 2 — roadmap, projections, tax, insights) ───────
+@app.route("/api/analyze-deep", methods=["POST"])
+def analyze_deep():
+    if not gemini_model:
+        return jsonify({"success": False, "error": "Gemini not configured"}), 500
+    raw_text = ""
+    try:
+        data = request.get_json(force=True)
+        profile = build_profile(data)
+
+        prompt = f"""Indian CFP expert. Generate investment plan for this profile. Return ONLY compact JSON, no markdown.
+
+PROFILE:
+{profile}
+
+Use Indian instruments: PPF, ELSS, NPS, SIP, Nifty index funds, FD.
+Use Indian tax laws: 80C (Rs.1.5L), 80D, 80CCD(1B).
+Keep all text fields SHORT (under 15 words each).
+
+Return ONLY this JSON (start with {{, end with }}):
+{{
+  "future_projections": [
+    {{"year":1,  "projected_savings":<n>, "projected_investment_value":<n>, "net_worth":<n>}},
+    {{"year":3,  "projected_savings":<n>, "projected_investment_value":<n>, "net_worth":<n>}},
+    {{"year":5,  "projected_savings":<n>, "projected_investment_value":<n>, "net_worth":<n>}},
+    {{"year":10, "projected_savings":<n>, "projected_investment_value":<n>, "net_worth":<n>}},
+    {{"year":20, "projected_savings":<n>, "projected_investment_value":<n>, "net_worth":<n>}}
+  ],
+  "investment_roadmap": [
+    {{
+      "priority": <1-5>,
+      "category": "<PPF|ELSS|NPS|Emergency Fund|Index Fund|FD>",
+      "action": "<under 12 words>",
+      "allocation_percent": <n>,
+      "monthly_amount": <n>,
+      "expected_return": "<e.g. 11-13% CAGR>",
+      "timeline": "<e.g. 5 years>",
+      "risk_level": "<Low|Medium|High>",
+      "why": "<under 12 words>"
+    }}
+  ],
+  "spending_breakdown": [
+    {{"category":"<n>","suggested_percent":<n>,"suggested_amount":<n>,"current_status":"<On Track|Over Budget|Under Utilized>"}}
+  ],
+  "spending_tracker_categories": [
+    {{"category":"<n>","recommended_monthly":<n>,"icon":"<emoji>","tips":"<under 10 words>"}}
+  ],
+  "tax_optimization": {{
+    "estimated_tax_bracket": "<slab>",
+    "annual_tax_estimate": <n>,
+    "strategies": [
+      {{"strategy":"<name>","potential_savings":"<Rs.X/yr>","how":"<under 15 words>","priority":"<High|Medium|Low>"}}
+    ],
+    "tax_advantaged_accounts": ["<account: 1 line>"],
+    "summary": "<2 sentences>"
+  }},
+  "ai_insights": "<3 short paragraphs, each under 50 words, Indian context, use their actual numbers>"
+}}"""
+
+        print(f"[deep] {data.get('name')} — sending phase 2")
+        response = gemini_model.generate_content(prompt)
+        raw_text = response.text
+        result   = extract_json(raw_text)
+        print(f"[deep] done — roadmap items:{len(result.get('investment_roadmap', []))}")
+        return jsonify({"success": True, "data": result})
+
+    except json.JSONDecodeError as e:
+        print(f"[deep] JSON error: {e}\n{raw_text[:800]}")
+        return jsonify({"success": False, "error": f"JSON parse failed: {e}"}), 500
+    except Exception as e:
+        print(f"[deep] error: {e}"); traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -217,39 +217,32 @@ YOU MUST respond with ONLY a valid JSON object. No markdown. No extra text. Star
 @app.route("/api/chat", methods=["POST"])
 def chat():
     if not gemini_model:
-        return jsonify({"success": False, "error": "Gemini API key not configured"}), 500
-
+        return jsonify({"success": False, "error": "Gemini not configured"}), 500
     try:
         data         = request.get_json(force=True)
         user_message = data.get("message", "").strip()
         context      = data.get("context", "")
         history      = data.get("history", [])
-
         if not user_message:
-            return jsonify({"success": False, "error": "No message provided"}), 400
+            return jsonify({"success": False, "error": "No message"}), 400
 
-        # Build chat history in Gemini format
         chat_history = []
         for msg in history[-6:]:
             role = "user" if msg["role"] == "user" else "model"
             chat_history.append({"role": role, "parts": [{"text": msg["content"]}]})
 
         system_prefix = (
-            "You are a senior AI Financial Advisor specializing in Indian personal finance, "
-            "SIP, mutual funds, PPF, NPS, ELSS, tax planning under Indian law, and wealth management.\n"
-            f"Client financial profile:\n{context}\n\n"
-            "Give precise, actionable advice using Indian financial instruments and tax laws. "
-            "Reference their actual numbers. Keep responses concise (3-5 sentences) unless detail is needed.\n\n"
+            "You are an Indian financial advisor. Client profile:\n"
+            f"{context}\n\n"
+            "Give concise advice (3-4 sentences max) using Indian instruments (SIP/PPF/NPS/ELSS) and tax laws.\n"
             "Client question: "
         )
-
         chat_session = gemini_model.start_chat(history=chat_history)
         response     = chat_session.send_message(system_prefix + user_message)
         return jsonify({"success": True, "response": response.text})
 
     except Exception as e:
-        print(f"[chat] ERROR: {e}")
-        traceback.print_exc()
+        print(f"[chat] error: {e}"); traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -257,8 +250,7 @@ def chat():
 @app.route("/api/spending-advice", methods=["POST"])
 def spending_advice():
     if not gemini_model:
-        return jsonify({"success": False, "error": "Gemini API key not configured"}), 500
-
+        return jsonify({"success": False, "error": "Gemini not configured"}), 500
     try:
         data     = request.get_json(force=True)
         category = data.get("category", "General")
@@ -267,38 +259,26 @@ def spending_advice():
         income   = data.get("income", 0)
 
         prompt = (
-            f'As an Indian financial advisor, give 3 specific actionable tips for the "{category}" spending category.\n'
-            f"Current spend: Rs.{amount}/month. Recommended budget: Rs.{budget}/month. Monthly income: Rs.{income}.\n"
-            "Respond with ONLY a JSON array — no markdown, no extra text:\n"
-            '[{"tip": "...", "potential_saving": "Rs.X/month", "difficulty": "Easy|Medium|Hard"}]'
+            f'3 tips for "{category}" spending. Spend:Rs.{amount} Budget:Rs.{budget} Income:Rs.{income}.\n'
+            "JSON array only: "
+            '[{"tip":"<under 12 words>","potential_saving":"Rs.X/month","difficulty":"Easy|Medium|Hard"}]'
         )
-
         response = gemini_model.generate_content(prompt)
         raw      = response.text.strip()
-
-        # Strip markdown fences
-        if raw.startswith("```"):
-            raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-            raw = re.sub(r"\s*```\s*$",        "", raw, flags=re.MULTILINE)
-            raw = raw.strip()
-
-        tips = json.loads(raw)
+        raw      = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+        raw      = re.sub(r"\s*```\s*$",        "", raw, flags=re.MULTILINE)
+        tips     = json.loads(raw.strip())
         if not isinstance(tips, list):
-            raise ValueError("Not a JSON array")
-
+            raise ValueError("Not array")
         return jsonify({"success": True, "tips": tips[:3]})
 
     except Exception as e:
-        print(f"[spending-advice] ERROR: {e} — returning fallback tips")
-        # Always return fallback so UI never breaks
-        return jsonify({
-            "success": True,
-            "tips": [
-                {"tip": "Track every expense daily using a free app like Walnut or ET Money", "potential_saving": "Rs.500-1000/month", "difficulty": "Easy"},
-                {"tip": "Set a weekly cash limit for this category to avoid impulse spending",  "potential_saving": "Rs.300-800/month",  "difficulty": "Easy"},
-                {"tip": "Compare 3 alternatives before any purchase above Rs.500",              "potential_saving": "Rs.200-600/month",  "difficulty": "Medium"}
-            ]
-        })
+        print(f"[spending] error: {e}")
+        return jsonify({"success": True, "tips": [
+            {"tip": "Track daily expenses using Walnut or ET Money", "potential_saving": "Rs.500-1000/month", "difficulty": "Easy"},
+            {"tip": "Set weekly cash limit for this category",        "potential_saving": "Rs.300-800/month",  "difficulty": "Easy"},
+            {"tip": "Compare 3 options before any purchase over Rs.500","potential_saving":"Rs.200-600/month", "difficulty": "Medium"}
+        ]})
 
 
 # ── /api/health ───────────────────────────────────────────────────────────────
@@ -307,17 +287,16 @@ def health():
     return jsonify({
         "status": "ok",
         "model": "gemini-2.5-flash",
-        "currency": "INR (Rs. / ₹)",
+        "currency": "INR",
         "gemini_configured": gemini_model is not None
     })
 
 
 if __name__ == "__main__":
-    print("\n" + "=" * 55)
-    print("  AI Financial Advisor — Backend")
-    print("  Model    : gemini-2.5-flash")
-    print("  Port     : 5000")
-    print("  Currency : Indian Rupees (Rs. / ₹)")
-    print(f"  Gemini   : {'✓ Configured' if gemini_model else '✗ NOT configured — check .env'}")
-    print("=" * 55 + "\n")
+    print("\n" + "="*55)
+    print("  AI Financial Advisor — 2-Phase Backend")
+    print("  Phase 1 /api/analyze-quick  → ~15s")
+    print("  Phase 2 /api/analyze-deep   → ~20s (parallel)")
+    print(f"  Gemini: {'✓ Ready' if gemini_model else '✗ Check .env'}")
+    print("="*55 + "\n")
     app.run(debug=True, port=5000)
