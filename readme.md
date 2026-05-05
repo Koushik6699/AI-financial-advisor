@@ -6,6 +6,10 @@ Built as a college capstone project by **Koushik M**, B.Tech CSE (AIML), Amity U
 
 ---
 
+## LIVE DEMO : https://finance-advisor-ai.netlify.app/
+
+---
+
 ## Features
 
 - **Financial Fitness Score** — AI-generated 0–100 score with grade (A+ to F) across 6 health metrics
